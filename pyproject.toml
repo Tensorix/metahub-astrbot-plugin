@@ -1,0 +1,9 @@
+[project]
+name = "metahub-astrbot-plugin"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = [
+    "astrbot>=4.10.4",
+]
