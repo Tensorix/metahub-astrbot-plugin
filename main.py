@@ -44,13 +44,21 @@ class MyPlugin(Star):
         if not c_type:
             return None
             
+        if isinstance(c_type, Enum):
+            c_type = c_type.value
+        elif hasattr(c_type, "value") and not isinstance(c_type, str):
+            c_type = c_type.value
         c_type = str(c_type)
+        if "." in c_type:
+            c_type = c_type.split(".")[-1]
+        c_type = c_type.strip()
+        c_type_lower = c_type.lower()
         
-        if c_type == "Plain":
+        if c_type_lower == "plain":
             return {"type": "text", "text": data.get("text", "")}
-        elif c_type == "At":
+        elif c_type_lower == "at":
             return {"type": "at", "qq": data.get("qq") or data.get("user_id"), "name": data.get("name")}
-        elif c_type == "Image":
+        elif c_type_lower == "image":
             return {"type": "image", "file": data.get("file") or data.get("url")}
         
         return None
@@ -102,6 +110,8 @@ class MyPlugin(Star):
                 converted = self._convert_component(component)
                 if converted:
                     payload["message"].append(converted)
+                else:
+                    logger.error(f"转换消息组件失败: {component}")
             
             # Add raw_message for debugging if needed
             # payload["raw_message"] = json.loads(json.dumps(vars(msg_obj), default=str))
