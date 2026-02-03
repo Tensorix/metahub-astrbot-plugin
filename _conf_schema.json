@@ -1,11 +1,16 @@
-{   
+{
     "base_url":{
-        "description": "MeataHub Base URL",
+        "description": "MetaHub Base URL",
         "type": "string",
         "default": "https://app.tensorix.org/api/v1"
     },
     "api_key": {
-        "description": "MeataHub API Key",
+        "description": "MetaHub API Key",
         "type": "string"
+    },
+    "default_source": {
+        "description": "默认 WebSocket Source（如 astr_qq、astr_wechat）",
+        "type": "string",
+        "default": "astr_default"
     }
 }
