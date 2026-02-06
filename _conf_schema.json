@@ -7,10 +7,5 @@
     "api_key": {
         "description": "MetaHub API Key",
         "type": "string"
-    },
-    "default_source": {
-        "description": "默认 WebSocket Source（如 astr_qq、astr_wechat）",
-        "type": "string",
-        "default": "astr_default"
     }
 }

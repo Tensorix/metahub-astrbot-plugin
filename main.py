@@ -13,32 +13,57 @@ from .metahub_ws import MetaHubWebSocket
 class MyPlugin(Star):
     def __init__(self, context: Context, config: AstrBotConfig):
         super().__init__(context)
-        
+
         # Webhook 客户端（fallback）
         self.mh_client = MetaHub(
             base_url=config["base_url"], api_key=config["api_key"]
         )
-        
-        # WebSocket 客户端
+
+        # WebSocket 客户端（multi-source 模式）
         self.mh_ws: MetaHubWebSocket = None
         self.config = config
-        
-        # 存储 unified_msg_origin 到 source 的映射
+
+        # 存储 session_id → source 的映射（用于下行消息路由）
         self.session_source_map = {}
     
     async def initialize(self):
-        """异步初始化，建立 WebSocket 连接并测试可用性"""
+        """异步初始化，建立 multi-source WebSocket 连接并预注册所有平台"""
         try:
-            # 从配置获取默认 source，或使用 "astr_default"
-            default_source = self.config.get("default_source", "astr_default")
-            logger.info(f"🔌 正在建立 WebSocket 连接 (source={default_source})...")
+            # 获取所有已加载的平台
+            platforms = self.context.platform_manager.get_insts()
 
-            # 创建正式的 WebSocket 连接
+            # 提取 source 列表
+            initial_sources = []
+
+            for platform in platforms:
+                try:
+                    # 使用 meta() 方法获取平台元数据
+                    metadata = platform.meta()
+                    platform_name = metadata.name  # 平台类型名称，如 "aiocqhttp", "webchat", "telegram"
+
+                    # 转换为 source 格式（与消息发送时保持一致）
+                    source = f"astr_{platform_name}"
+                    initial_sources.append(source)
+
+                    logger.info(f"🔍 发现平台: {metadata.adapter_display_name or platform_name} → source: {source}")
+
+                except Exception as e:
+                    logger.warning(f"⚠️  无法获取平台元数据: {platform.__class__.__name__}, 错误: {e}")
+                    continue
+
+            logger.info("🔌 正在建立 multi-source WebSocket 连接...")
+            if initial_sources:
+                logger.info(f"📋 检测到 {len(initial_sources)} 个已加载的平台")
+                logger.info(f"🎯 预注册 sources: {initial_sources}")
+            else:
+                logger.warning("⚠️  未检测到已加载的平台，将使用动态注册模式")
+
+            # 创建 multi-source WebSocket 连接
             self.mh_ws = MetaHubWebSocket(
                 base_url=self.config["base_url"],
                 api_key=self.config["api_key"],
-                source=default_source,
-                on_send_message=self._handle_metahub_send_message
+                on_send_message=self._handle_metahub_send_message,
+                initial_sources=initial_sources
             )
 
             # 启动连接
@@ -54,7 +79,11 @@ class MyPlugin(Star):
 
             if connected:
                 logger.info("✅ WebSocket 连接成功建立并已测试可用")
-                logger.info(f"📡 当前使用 WebSocket 模式 (source={default_source})")
+                logger.info("📡 当前使用 multi-source WebSocket 模式")
+                if self.mh_ws._registered_sources:
+                    logger.info(f"✅ 已预注册平台: {sorted(self.mh_ws._registered_sources)}")
+                else:
+                    logger.info("📋 等待动态注册平台...")
             else:
                 logger.warning("❌ WebSocket 连接建立超时（5秒）")
                 logger.warning("⚠️  将使用 Webhook 模式作为备选方案")
@@ -69,46 +98,45 @@ class MyPlugin(Star):
                 await self.mh_ws.stop()
                 self.mh_ws = None
     
-    async def _ensure_websocket(self, source: str):
-        """确保 WebSocket 连接已建立并匹配当前 source"""
-        # 如果 WebSocket 存在且 source 匹配，检查连接状态
-        if self.mh_ws and self.mh_ws.source == source:
-            if self.mh_ws.is_connected:
-                return  # 连接正常，无需处理
-            else:
-                logger.warning(f"⚠️  WebSocket 连接断开 (source={source})，等待自动重连...")
-                # 等待自动重连（最多2秒）
-                for i in range(20):
-                    if self.mh_ws.is_connected:
-                        logger.info(f"✅ WebSocket 已重新连接 (source={source})")
-                        return
-                    await asyncio.sleep(0.1)
+    async def _ensure_source_registered(self, source: str) -> bool:
+        """
+        确保 source 已注册到 WebSocket（动态注册）
 
-        # 如果 source 不同，需要切换连接
-        if self.mh_ws and self.mh_ws.source != source:
-            logger.info(f"🔄 检测到 source 变更: {self.mh_ws.source} → {source}，重建连接...")
-            await self.mh_ws.stop()
-            self.mh_ws = None
+        Args:
+            source: IM 平台标识（从 event.get_platform_name() 自动生成）
 
-        # 创建新的 WebSocket 连接
-        if self.mh_ws is None:
-            logger.info(f"🔌 为 source={source} 建立新的 WebSocket 连接...")
-            self.mh_ws = MetaHubWebSocket(
-                base_url=self.config["base_url"],
-                api_key=self.config["api_key"],
-                source=source,
-                on_send_message=self._handle_metahub_send_message
-            )
-            await self.mh_ws.start()
+        Returns:
+            bool: 是否注册成功
+        """
+        if not self.mh_ws:
+            logger.warning("⚠️  WebSocket 未初始化，无法注册 source")
+            return False
 
-            # 等待连接建立（最多3秒）
-            for i in range(30):
+        if not self.mh_ws.is_connected:
+            logger.warning("⚠️  WebSocket 未连接，等待自动重连...")
+            # 等待自动重连（最多2秒）
+            for i in range(20):
                 if self.mh_ws.is_connected:
-                    logger.info(f"✅ WebSocket 连接已建立 (source={source})")
-                    return
+                    logger.info("✅ WebSocket 已重新连接")
+                    break
                 await asyncio.sleep(0.1)
+            else:
+                logger.warning("❌ WebSocket 重连超时")
+                return False
 
-            logger.warning(f"❌ WebSocket 连接建立超时（3秒），source={source}")
+        # 如果 source 未注册，动态添加
+        if source not in self.mh_ws._registered_sources:
+            logger.info(f"🆕 检测到新平台: {source}，自动注册到 WebSocket...")
+            success = await self.mh_ws.add_sources([source])
+            if success:
+                logger.info(f"✅ 平台注册成功: {source}")
+                logger.info(f"📊 当前已注册平台: {sorted(self.mh_ws._registered_sources)}")
+            else:
+                logger.warning(f"⚠️  平台注册失败: {source}")
+            return success
+
+        # 已注册，直接返回成功
+        return True
     
     async def _handle_metahub_send_message(self, data: dict) -> dict:
         """
@@ -215,20 +243,20 @@ class MyPlugin(Star):
             # 获取 unified_msg_origin 和 source
             unified_msg_origin = event.unified_msg_origin
             source = f"astr_{event.get_platform_name()}"
-            
-            # 确保 WebSocket 连接已建立
-            await self._ensure_websocket(source)
-            
-            # 存储映射关系
+
+            # 确保 source 已注册（multi-source 模式）
+            await self._ensure_source_registered(source)
+
+            # 存储映射关系（用于下行消息路由）
             self.session_source_map[unified_msg_origin] = source
             
-            # Construct payload
+            # Construct payload（multi-source 模式必须包含 source）
             payload = {
+                "source": source,  # multi-source 模式必填
                 "timestamp": get_attr(msg_obj, "timestamp"),
                 "session_id": unified_msg_origin,  # 使用 unified_msg_origin
                 "message_id": get_attr(msg_obj, "message_id"),
                 "session_type": session_type,
-                "source": source,
                 "self_id": event.get_self_id(),
                 "message_str": event.message_str,
                 "message": []

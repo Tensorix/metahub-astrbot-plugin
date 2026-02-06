@@ -9,36 +9,39 @@ logger = logging.getLogger(__name__)
 
 
 class MetaHubWebSocket:
-    """MetaHub WebSocket 客户端，支持双向消息传递和自动重连"""
-    
+    """MetaHub WebSocket 客户端，支持 multi-source 模式的双向消息传递和自动重连"""
+
     def __init__(
         self,
         base_url: str,
         api_key: str,
-        source: str,
-        on_send_message: Optional[Callable[[dict], Awaitable[dict]]] = None
+        on_send_message: Optional[Callable[[dict], Awaitable[dict]]] = None,
+        initial_sources: Optional[list[str]] = None
     ):
         """
-        初始化 WebSocket 客户端
-        
+        初始化 WebSocket 客户端（multi-source 模式）
+
         Args:
             base_url: MetaHub 基础URL (如 https://app.tensorix.org/api/v1)
             api_key: API Key (sk-xxx 格式)
-            source: IM 平台标识 (如 astr_qq)
             on_send_message: 处理下行消息的回调函数，返回 {"success": bool, "data": dict, "error": str}
+            initial_sources: 初始注册的 sources 列表 (如 ["astr_qq", "astr_wechat"])
         """
         self.base_url = base_url.replace("http://", "ws://").replace("https://", "wss://")
         self.api_key = api_key
-        self.source = source
         self.on_send_message = on_send_message
-        
+
+        # Multi-source 管理
+        self.sources: set[str] = set(initial_sources or [])
+        self._registered_sources: set[str] = set()
+
         self.ws: Optional[websockets.WebSocketClientProtocol] = None
         self._connected = False
         self._running = False
         self._reconnect_delay = 5  # 初始重连间隔（秒）
         self._max_reconnect_delay = 60  # 最大重连间隔
         self._heartbeat_interval = 30  # 心跳间隔
-        
+
         self._connect_task: Optional[asyncio.Task] = None
         self._heartbeat_task: Optional[asyncio.Task] = None
         self._receive_task: Optional[asyncio.Task] = None
@@ -103,26 +106,75 @@ class MetaHubWebSocket:
                     await asyncio.sleep(self._reconnect_delay)
 
     async def _connect(self):
-        """建立 WebSocket 连接"""
-        url = f"{self.base_url}/im/gateway?token={self.api_key}&source={self.source}"
-        logger.info(f"正在连接到 MetaHub WebSocket: {url.split('?')[0]}")
-        
+        """建立 WebSocket 连接（multi-source 模式）"""
+        # multi-source 模式不传 source 参数
+        url = f"{self.base_url}/im/gateway?token={self.api_key}"
+        logger.info(f"🔌 正在连接到 MetaHub WebSocket (multi-source): {url.split('?')[0]}")
+
         async with websockets.connect(url) as ws:
             self.ws = ws
             self._connected = True
             self._reconnect_delay = 5  # 重置重连延迟
-            logger.info(f"已连接到 MetaHub (source: {self.source})")
-            
+            logger.info("✅ 已连接到 MetaHub (multi-source 模式)")
+
+            # 注册 sources
+            if self.sources:
+                await self._register_sources(list(self.sources))
+            else:
+                logger.warning("⚠️  未配置初始 sources，等待动态注册")
+
             # 启动心跳和接收任务
             self._heartbeat_task = asyncio.create_task(self._heartbeat_loop())
             self._receive_task = asyncio.create_task(self._receive_loop())
-            
+
             # 等待任务完成（通常是连接断开）
             await asyncio.gather(
                 self._heartbeat_task,
                 self._receive_task,
                 return_exceptions=True
             )
+
+    async def _register_sources(self, sources: list[str]):
+        """注册 sources 到服务端"""
+        if not self.ws or not self._connected:
+            logger.error("❌ WebSocket 未连接，无法注册 sources")
+            return False
+
+        try:
+            register_msg = {
+                "type": "register",
+                "sources": sources
+            }
+            await self.ws.send(json.dumps(register_msg))
+            logger.info(f"📝 发送 register 请求: {sources}")
+
+            # 等待 register_ack（最多 5 秒）
+            for _ in range(50):
+                if self._registered_sources == set(sources):
+                    return True
+                await asyncio.sleep(0.1)
+
+            logger.warning(f"⚠️  register_ack 超时，sources: {sources}")
+            return False
+
+        except Exception as e:
+            logger.error(f"❌ 注册 sources 失败: {e}", exc_info=True)
+            return False
+
+    async def add_sources(self, sources: list[str]):
+        """动态添加新的 sources"""
+        new_sources = [s for s in sources if s not in self.sources]
+        if not new_sources:
+            logger.debug(f"所有 sources 已注册: {sources}")
+            return True
+
+        self.sources.update(new_sources)
+
+        if self._connected and self.ws:
+            return await self._register_sources(new_sources)
+        else:
+            logger.info(f"WebSocket 未连接，sources 将在连接建立时注册: {new_sources}")
+            return False
 
     async def _heartbeat_loop(self):
         """心跳保活循环"""
@@ -147,10 +199,17 @@ class MetaHubWebSocket:
 
                     if msg_type == "pong":
                         logger.debug("💓 收到心跳 pong")
+                    elif msg_type == "register_ack":
+                        # 处理 register 响应
+                        ack_sources = data.get("sources", [])
+                        self._registered_sources = set(ack_sources)
+                        logger.info(f"✅ Sources 注册成功: {ack_sources}")
                     elif msg_type == "send_message":
-                        logger.info(f"📥 [WebSocket] 收到下行消息: type={msg_type}, request_id={data.get('request_id')}")
+                        logger.info(f"📥 [WebSocket] 收到下行消息: type={msg_type}, request_id={data.get('request_id')}, session_id={data.get('session_id')}")
                         # 异步处理发送消息指令，不阻塞接收
                         asyncio.create_task(self._handle_send_message(data))
+                    elif msg_type == "error":
+                        logger.error(f"❌ 服务端返回错误: {data.get('message')}")
                     else:
                         logger.warning(f"⚠️  收到未知消息类型: {msg_type}, 数据: {data}")
 
@@ -228,10 +287,10 @@ class MetaHubWebSocket:
 
     async def send_message(self, message_data: dict) -> bool:
         """
-        发送消息到 MetaHub（上行）
+        发送消息到 MetaHub（上行，multi-source 模式）
 
         Args:
-            message_data: 消息数据，格式参考文档中的 message 类型
+            message_data: 消息数据，**必须**包含 source 字段
 
         Returns:
             是否发送成功
@@ -239,6 +298,17 @@ class MetaHubWebSocket:
         if not self.is_connected:
             logger.warning(f"⚠️  WebSocket 未连接，无法发送消息 (ws={self.ws is not None}, connected={self._connected})")
             return False
+
+        # multi-source 模式：source 必填
+        source = message_data.get('source')
+        if not source:
+            logger.error("❌ multi-source 模式下 message_data.source 必填")
+            return False
+
+        # 如果 source 未注册，动态添加
+        if source not in self._registered_sources:
+            logger.info(f"🔄 检测到新 source: {source}，自动注册...")
+            await self.add_sources([source])
 
         try:
             payload = {
@@ -248,7 +318,7 @@ class MetaHubWebSocket:
             await self.ws.send(json.dumps(payload))
             session_id = message_data.get('session_id')
             msg_id = message_data.get('message_id')
-            logger.info(f"📤 [WebSocket] 发送上行消息: session_id={session_id}, message_id={msg_id}")
+            logger.info(f"📤 [WebSocket] 发送上行消息: source={source}, session_id={session_id}, message_id={msg_id}")
             return True
         except ConnectionClosed as e:
             logger.error(f"❌ 发送消息失败 - 连接已关闭: code={e.code}, reason={e.reason}")
