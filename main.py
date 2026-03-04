@@ -9,7 +9,41 @@ from .metahub import MetaHub
 from .metahub_ws import MetaHubWebSocket
 
 
-@register("MetaHub", "Tensorix", "MetaHub 集成插件", "0.0.1")
+def _safe_serialize(obj, depth=0, max_depth=6, seen=None):
+    """安全序列化任意对象，处理循环引用和递归深度"""
+    if seen is None:
+        seen = set()
+    if depth > max_depth:
+        return f"<depth_limit:{type(obj).__name__}>"
+    obj_id = id(obj)
+    if obj_id in seen:
+        return "<circular>"
+    if obj is None or isinstance(obj, (bool, int, float, str)):
+        return obj
+    if isinstance(obj, Enum):
+        return obj.value
+    if isinstance(obj, (list, tuple)):
+        seen.add(obj_id)
+        try:
+            return [_safe_serialize(i, depth + 1, max_depth, seen) for i in obj]
+        finally:
+            seen.discard(obj_id)
+    if isinstance(obj, dict):
+        seen.add(obj_id)
+        try:
+            return {str(k): _safe_serialize(v, depth + 1, max_depth, seen) for k, v in obj.items()}
+        finally:
+            seen.discard(obj_id)
+    if hasattr(obj, '__dict__'):
+        seen.add(obj_id)
+        try:
+            return {str(k): _safe_serialize(v, depth + 1, max_depth, seen) for k, v in vars(obj).items()}
+        finally:
+            seen.discard(obj_id)
+    return str(obj)
+
+
+@register("MetaHub", "Tensorix", "MetaHub 集成插件", "0.0.2")
 class MyPlugin(Star):
     def __init__(self, context: Context, config: AstrBotConfig):
         super().__init__(context)
@@ -229,6 +263,22 @@ class MyPlugin(Star):
         """接收所有消息并转发到 MetaHub"""
         try:
             msg_obj = event.message_obj
+            try:
+                event_log = {
+                    "platform":    event.get_platform_name(),
+                    "session_id":  event.unified_msg_origin,
+                    "self_id":     event.get_self_id(),
+                    "message_str": event.message_str,
+                    "sender": {
+                        "id":   event.get_sender_id(),
+                        "name": event.get_sender_name(),
+                    },
+                    "message_obj": _safe_serialize(msg_obj),
+                    "message":     _safe_serialize(event.get_messages()),
+                }
+                logger.debug(f"🔎 [完整事件] {json.dumps(event_log, ensure_ascii=False)}")
+            except Exception as _e:
+                logger.debug(f"🔎 [完整事件] 序列化失败: {_e}, event={event}")
             
             # Safe attribute access helper
             def get_attr(obj, name, default=None):
@@ -283,9 +333,16 @@ class MyPlugin(Star):
                 else:
                     logger.debug(f"跳过无法转换的消息组件: {component}")
             
+            # 过滤：message 列表为空则不发送
+            if not payload["message"]:
+                logger.debug(f"⏭️  消息组件列表为空，跳过发送: session_id={unified_msg_origin}, message_str='{event.message_str}'")
+                return
+
             # 优先使用 WebSocket 发送，失败则降级到 Webhook
             success = False
             ws_error_reason = None
+            
+            logger.debug(f"📦 [发送数据] payload={json.dumps(payload, ensure_ascii=False)}")
 
             if self.mh_ws and self.mh_ws.is_connected:
                 success = await self.mh_ws.send_message(payload)
